@@ -1,31 +1,18 @@
 //! An efficient way to check whether a given package has been yanked
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 
 use crate::{
     error::{Error, ErrorKind},
     package::{self, Package},
 };
 
-pub use tame_index::external::reqwest::blocking::ClientBuilder;
+use tame_index::{IndexKrate, KrateName};
+pub use tame_index::external::reqwest::ClientBuilder;
 
 enum Index {
     Git(tame_index::index::RemoteGitIndex),
     SparseCached(tame_index::index::SparseIndex),
-    SparseRemote(tame_index::index::RemoteSparseIndex),
-}
-
-impl Index {
-    #[inline]
-    fn krate(&self, name: &package::Name) -> Result<Option<tame_index::IndexKrate>, Error> {
-        let name = name.as_str().try_into()?;
-        let res = match self {
-            Self::Git(gi) => gi.krate(name, true),
-            Self::SparseCached(si) => si.cached_krate(name),
-            Self::SparseRemote(rsi) => rsi.krate(name, true),
-        };
-
-        Ok(res?)
-    }
+    SparseRemote(tame_index::index::AsyncRemoteSparseIndex),
 }
 
 /// Provides an efficient way to check if the given package has been yanked.
@@ -74,7 +61,7 @@ impl CachedIndex {
                     .build()
                     .map_err(tame_index::Error::from)?;
 
-                Index::SparseRemote(tame_index::index::RemoteSparseIndex::new(si, client))
+                Index::SparseRemote(tame_index::index::AsyncRemoteSparseIndex::new(si, client))
             }
         };
 
@@ -113,33 +100,45 @@ impl CachedIndex {
     /// Populates the cache entries for all of the specified crates
     ///
     /// This method is preferable to doing invidual updates via `cache_insert`/`is_yanked`
-    pub fn populate_cache(&mut self, packages: std::collections::BTreeSet<&package::Name>) {
-        match &self.index {
-            Index::Git(_) | Index::SparseCached(_) => {
-                for pkg in packages {
-                    let Some(ik) = self.index.krate(pkg).ok().flatten() else { continue; };
-                    self.insert(pkg, ik);
-                }
+    pub fn populate_cache(&mut self, packages: BTreeSet<&package::Name>) -> Result<(), Error> {
+        let names: Result<Vec<KrateName<'_>>, tame_index::Error> = packages.iter().map(|name| name.as_str().try_into()).collect();
+        let names = names?;
+        let index_krates: Vec<Result<Option<IndexKrate>, tame_index::Error>> = match &self.index {
+            Index::Git(gi) => {
+                names.iter().map(|name| gi.krate(*name, true)).collect()
+            }            
+            Index::SparseCached(si) => {
+                names.iter().map(|name| si.cached_krate(*name)).collect()
             }
             Index::SparseRemote(rsi) => {
-                use rayon::prelude::*;
-                let index_krates: Vec<_> = packages
-                    .into_par_iter()
-                    .filter_map(|pkg| {
-                        let name = pkg.as_str().try_into().ok()?;
-                        rsi.krate(name, true).ok().flatten().map(|ik| (pkg, ik))
-                    })
-                    .collect();
+                // Issue all HTTP requests at once, up front
+                let requests: Vec<_> = names.iter().map(|name| {
+                    rsi.krate_async(*name, true)
+                }).collect();
 
-                for (pkg, ik) in index_krates {
-                    self.insert(pkg, ik);
-                }
+                // Wait for all of them to complete, concurrently
+                use tokio::runtime::Runtime;
+                let runtime  = Runtime::new().unwrap();
+                // TODO: try_join_all is a better fit because it fails fast
+                runtime.block_on(futures::future::join_all(requests))
             }
+        };
+
+        for (pkg, ik) in packages.iter().zip(index_krates) {
+            let ik = ik?.ok_or_else(|| {
+                format_err!(
+                    ErrorKind::NotFound,
+                    "no such crate in the crates.io index: {package}"
+                )
+            })?;
+            self.insert(pkg, ik);
         }
+
+        Ok(())
     }
 
     #[inline]
-    fn insert(&mut self, package: &package::Name, index_krate: tame_index::IndexKrate) {
+    fn insert(&mut self, package: &package::Name, index_krate: IndexKrate) {
         let versions: HashMap<String, bool> = index_krate
             .versions
             .into_iter()
@@ -151,16 +150,7 @@ impl CachedIndex {
 
     /// Load all version of the given crate from the crates.io index and put them into the cache
     pub fn cache_insert(&mut self, package: &package::Name) -> Result<(), Error> {
-        let crate_releases = self.index.krate(package)?.ok_or_else(|| {
-            format_err!(
-                ErrorKind::NotFound,
-                "no such crate in the crates.io index: {package}"
-            )
-        })?;
-
-        // We already loaded the full crate information, so populate all the versions in the cache
-        self.insert(package, crate_releases);
-        Ok(())
+        self.populate_cache(BTreeSet::from([package]))
     }
 
     /// Is the given package yanked?
