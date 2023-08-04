@@ -119,8 +119,11 @@ impl CachedIndex {
                 // Wait for all of them to complete, concurrently
                 use tokio::runtime::Runtime;
                 let runtime  = Runtime::new().unwrap();
+                let futures: Vec<_> = requests.into_iter().map(|r| tokio::spawn(r)).collect();
                 // TODO: try_join_all is a better fit because it fails fast
-                runtime.block_on(futures::future::join_all(requests))
+                let joined = runtime.block_on(futures::future::join_all(futures));
+                let joined2: Result<Vec<_>, _> = joined.into_iter().collect();
+                joined2.unwrap()
             }
         };
 
